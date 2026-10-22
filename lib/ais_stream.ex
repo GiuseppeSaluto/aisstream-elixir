@@ -24,13 +24,16 @@ defmodule AisStream do
     * `:filter_message_types` - list of message types, e.g. `["PositionReport"]`.
     * `:to` - pid or registered name that receives the messages. Defaults to the caller of
       `start_link/1`. Under a supervisor always pass it, otherwise messages go to the supervisor.
+      When it is a pid, the client stops when that process exits.
+    * `:ping_interval` - keepalive interval in ms, default `30_000`. At each interval the client
+      pings the server, and reconnects if nothing (not even a pong) arrived since the previous one.
     * `:url` - WebSocket URL. Defaults to `wss://stream.aisstream.io/v0/stream`.
 
   With an invalid API key AISStream closes the connection without an error message, so the
-  client keeps reconnecting and logging the disconnection.
+  client keeps reconnecting, with a growing delay, and logging the disconnection.
   """
 
-  use GenServer
+  use GenServer, restart: :transient
   require Logger
 
   @doc """
@@ -53,6 +56,7 @@ defmodule AisStream do
       url: URI.parse(Keyword.get(opts, :url, "wss://stream.aisstream.io/v0/stream")),
       subscription: JSON.encode!(subscription),
       to: Keyword.get(opts, :to, self()),
+      ping_interval: Keyword.get(opts, :ping_interval, 30_000),
       attempt: 0,
       conn: nil
     })
@@ -62,13 +66,33 @@ defmodule AisStream do
   def backoff(attempt), do: min(attempt, 30) * 1_000
 
   @impl true
-  def init(state), do: {:ok, state, {:continue, :connect}}
+  def init(state) do
+    # Nobody reads the messages once a :to pid is gone. A registered name may be restarted.
+    if is_pid(state.to), do: Process.monitor(state.to)
+    {:ok, state, {:continue, :connect}}
+  end
 
   @impl true
   def handle_continue(:connect, state), do: {:noreply, connect(state)}
 
   @impl true
   def handle_info(:connect, state), do: {:noreply, connect(state)}
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{to: pid} = state),
+    do: {:stop, :normal, state}
+
+  # Silent dead connections (Wi-Fi, router) never close: ping, and give up if nothing came back
+  def handle_info({:keepalive, ref}, %{conn: conn, ref: ref} = state) when conn != nil do
+    if state.received? do
+      Process.send_after(self(), {:keepalive, ref}, state.ping_interval)
+      {:noreply, send_frame(%{state | received?: false}, {:ping, ""})}
+    else
+      {:noreply, reconnect(state, :keepalive_timeout)}
+    end
+  end
+
+  # Timer of a connection we already dropped
+  def handle_info({:keepalive, _ref}, state), do: {:noreply, state}
 
   # Messages from a socket we already dropped
   def handle_info(_message, %{conn: nil} = state), do: {:noreply, state}
@@ -111,8 +135,11 @@ defmodule AisStream do
   defp handle_response({:done, ref}, state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.headers) do
       {:ok, conn, websocket} ->
+        # The opening counts as received: the first keepalive check sends a ping
+        Process.send_after(self(), {:keepalive, ref}, state.ping_interval)
+
         send_frame(
-          Map.merge(state, %{conn: conn, websocket: websocket, attempt: 0}),
+          Map.merge(state, %{conn: conn, websocket: websocket, received?: true}),
           {:text, state.subscription}
         )
 
@@ -124,7 +151,7 @@ defmodule AisStream do
   defp handle_response({:data, _ref, data}, state) do
     case Mint.WebSocket.decode(state.websocket, data) do
       {:ok, websocket, frames} ->
-        Enum.reduce(frames, %{state | websocket: websocket}, &handle_frame/2)
+        Enum.reduce(frames, %{state | websocket: websocket, received?: true}, &handle_frame/2)
 
       {:error, websocket, reason} ->
         reconnect(%{state | websocket: websocket}, reason)
@@ -137,11 +164,15 @@ defmodule AisStream do
 
   defp handle_frame({type, payload}, state) when type in [:text, :binary] do
     case JSON.decode(payload) do
-      {:ok, message} -> send(state.to, {:aisstream, message})
-      {:error, reason} -> Logger.warning("AisStream: skipping invalid JSON (#{inspect(reason)})")
-    end
+      {:ok, message} ->
+        send(state.to, {:aisstream, message})
+        # Reset only now: with an invalid key AISStream opens the connection and closes it at once
+        %{state | attempt: 0}
 
-    state
+      {:error, reason} ->
+        Logger.warning("AisStream: skipping invalid JSON (#{inspect(reason)})")
+        state
+    end
   end
 
   defp handle_frame({:ping, data}, state), do: send_frame(state, {:pong, data})

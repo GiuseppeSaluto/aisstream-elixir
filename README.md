@@ -4,6 +4,7 @@ Unofficial Elixir client for the [AISStream](https://aisstream.io) WebSocket API
 
 - Connects with permessage-deflate compression: AISStream limits bandwidth on uncompressed connections.
 - Re-sends the subscription after every reconnection, waiting 1 s, 2 s, ... up to 30 s between attempts.
+- Detects dead connections that never close (Wi-Fi, router) with WebSocket pings.
 - Sends every message to a process as `{:aisstream, message}`, where `message` is the decoded JSON map.
 
 ## Installation
@@ -49,10 +50,11 @@ children = [
 | `:api_key` | yes | AISStream API key |
 | `:bounding_boxes` | yes | List of boxes, each `[[lat1, lon1], [lat2, lon2]]` |
 | `:filter_message_types` | no | List of message types, e.g. `["PositionReport"]` |
-| `:to` | no | pid or registered name that receives the messages. Defaults to the caller of `start_link/1` |
+| `:to` | no | pid or registered name that receives the messages. Defaults to the caller of `start_link/1`. When it is a pid, the client stops when that process exits |
+| `:ping_interval` | no | Keepalive interval in ms, default `30_000`: the client pings the server and reconnects if nothing, not even a pong, arrived since the previous interval |
 | `:url` | no | WebSocket URL. Defaults to `wss://stream.aisstream.io/v0/stream` |
 
-With an invalid API key AISStream closes the connection without an error message, so the client keeps reconnecting and logging the disconnection.
+With an invalid API key AISStream closes the connection without an error message, so the client keeps reconnecting, with a growing delay, and logging the disconnection.
 
 ## Development
 

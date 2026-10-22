@@ -14,7 +14,7 @@ defmodule AisStream.MixProject do
         "Unofficial client for the AISStream WebSocket API, with compression and automatic reconnection.",
       source_url: @source_url,
       package: [licenses: ["MIT"], links: %{"GitHub" => @source_url}],
-      docs: [main: "readme", extras: ["README.md", "LICENSE"]]
+      docs: [main: "readme", extras: ["README.md", "CHANGELOG.md", "LICENSE"]]
     ]
   end
 

@@ -93,6 +93,38 @@ defmodule AisStreamTest do
 
       assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
     end
+
+    test "stops with reason :normal when the :to pid exits" do
+      {_server, url} = start_server()
+      sink = spawn(fn -> receive(do: (:stop -> :ok)) end)
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: sink]
+      {:ok, pid} = AisStream.start_link(opts)
+      ref = Process.monitor(pid)
+      assert_receive {:connected, _, _}, 1_000
+
+      send(sink, :stop)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    end
+
+    test "keeps running when a registered :to exits and delivers to the new owner of the name" do
+      name = :"aisstream_test_sink_#{System.unique_integer([:positive])}"
+      sink = spawn(fn -> receive(do: (:stop -> :ok)) end)
+      Process.register(sink, name)
+      {server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: name]
+      pid = start_supervised!({AisStream, opts})
+      assert_receive {:connected, _, _}, 1_000
+
+      ref = Process.monitor(sink)
+      send(sink, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^sink, :normal}, 1_000
+      Process.register(self(), name)
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+
+      assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
+      assert Process.alive?(pid)
+    end
   end
 
   describe "reconnection" do
@@ -110,6 +142,78 @@ defmodule AisStreamTest do
     test "backoff grows by 1 s per attempt up to 30 s" do
       assert Enum.map([1, 2, 3, 29, 30, 31, 1_000], &AisStream.backoff/1) ==
                [1_000, 2_000, 3_000, 29_000, 30_000, 30_000, 30_000]
+    end
+
+    # The attempt counter is observed by tracing the client's calls to backoff/1.
+    test "backoff counter keeps growing when connections close before any message" do
+      {server, url} = start_server()
+
+      pid =
+        start_supervised!({AisStream, api_key: "k", bounding_boxes: @boxes, url: url, to: self()})
+
+      assert_receive {:connected, _, subscription}, 1_000
+      :erlang.trace_pattern({AisStream, :backoff, 1}, true, [:local])
+      :erlang.trace(pid, true, [:call])
+
+      send(server, :close)
+      assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [1]}}, 1_000
+      assert_receive {:connected, _, ^subscription}, 2_000
+      send(server, :close)
+
+      assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [2]}}, 1_000
+    end
+
+    test "backoff counter resets once a message arrives on a connection" do
+      {server, url} = start_server()
+
+      pid =
+        start_supervised!({AisStream, api_key: "k", bounding_boxes: @boxes, url: url, to: self()})
+
+      assert_receive {:connected, _, subscription}, 1_000
+      :erlang.trace_pattern({AisStream, :backoff, 1}, true, [:local])
+      :erlang.trace(pid, true, [:call])
+
+      send(server, :close)
+      assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [1]}}, 1_000
+      assert_receive {:connected, _, ^subscription}, 2_000
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+      assert_receive {:aisstream, _}, 1_000
+      # Drop calls made for the first disconnection, so only the next ones count.
+      flush_traces(pid)
+      send(server, :close)
+
+      assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [1]}}, 1_000
+    end
+  end
+
+  describe "keepalive" do
+    test "sends a ping at the check when something was received" do
+      {server, _, _} = start_client(ping_interval: 50)
+
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+
+      assert_receive {:client_frame, 9, _}, 500
+    end
+
+    test "reconnects and subscribes again when nothing arrived during an interval" do
+      {_server, _, subscription} = start_client(ping_interval: 50)
+
+      assert_receive {:connected, _, ^subscription}, 2_000
+    end
+
+    test "stays connected while pings are answered with pongs, without AIS messages" do
+      {server, _, _} = start_client(ping_interval: 50)
+
+      # A server ping is the first thing received; no AIS message is ever sent.
+      send(server, {:frame, 9, ""})
+
+      # A reconnection would leave a gap of at least 1 s (backoff) between pings.
+      for _ <- 1..5 do
+        assert_receive {:client_frame, 9, payload}, 500
+        send(server, {:frame, 10, payload})
+      end
+
+      refute_received {:connected, _, _}
     end
   end
 
@@ -142,6 +246,9 @@ defmodule AisStreamTest do
   # permessage-deflate (allowed by RFC 7692), so frames are sent uncompressed.
   # Reports {:connected, request, subscription} to the test, then obeys
   # {:frame, opcode, payload} and :close, then accepts the next connection.
+  # Frames sent by the client after the subscription are reported to the test
+  # as {:client_frame, opcode, payload}; when the client closes the connection
+  # the server accepts the next one.
   defp start_server do
     test = self()
     {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
@@ -165,6 +272,8 @@ defmodule AisStreamTest do
 
     {1, subscription} = recv_frame(socket)
     send(test, {:connected, request, JSON.decode!(subscription)})
+    server = self()
+    spawn(fn -> read_frames(socket, server, test) end)
     command_loop(socket)
     serve(listen, test)
   end
@@ -177,8 +286,27 @@ defmodule AisStreamTest do
 
         command_loop(socket)
 
-      :close ->
+      msg when msg in [:close, {:closed, socket}] ->
         :gen_tcp.close(socket)
+    end
+  end
+
+  defp flush_traces(pid) do
+    receive do
+      {:trace, ^pid, :call, _} -> flush_traces(pid)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp read_frames(socket, server, test) do
+    case recv_frame(socket, :infinity) do
+      {:error, _} ->
+        send(server, {:closed, socket})
+
+      {opcode, payload} ->
+        send(test, {:client_frame, opcode, payload})
+        read_frames(socket, server, test)
     end
   end
 
@@ -192,18 +320,16 @@ defmodule AisStreamTest do
   end
 
   # Client frames are always masked (RFC 6455 5.3).
-  defp recv_frame(socket) do
-    {:ok, <<_fin_rsv::4, opcode::4, 1::1, len::7>>} = :gen_tcp.recv(socket, 2, 1_000)
-
-    len =
-      case len do
-        126 -> with {:ok, <<n::16>>} <- :gen_tcp.recv(socket, 2, 1_000), do: n
-        127 -> with {:ok, <<n::64>>} <- :gen_tcp.recv(socket, 8, 1_000), do: n
-        n -> n
-      end
-
-    {:ok, mask} = :gen_tcp.recv(socket, 4, 1_000)
-    {:ok, masked} = :gen_tcp.recv(socket, len, 1_000)
-    {opcode, :crypto.exor(masked, binary_part(:binary.copy(mask, div(len, 4) + 1), 0, len))}
+  defp recv_frame(socket, timeout \\ 1_000) do
+    with {:ok, <<_fin_rsv::4, opcode::4, 1::1, len::7>>} <- :gen_tcp.recv(socket, 2, timeout),
+         {:ok, len} <-
+           (case len do
+              126 -> with {:ok, <<n::16>>} <- :gen_tcp.recv(socket, 2, 1_000), do: {:ok, n}
+              127 -> with {:ok, <<n::64>>} <- :gen_tcp.recv(socket, 8, 1_000), do: {:ok, n}
+              n -> {:ok, n}
+            end),
+         {:ok, <<mask::binary-4, masked::binary>>} <- :gen_tcp.recv(socket, len + 4, 1_000) do
+      {opcode, :crypto.exor(masked, binary_part(:binary.copy(mask, div(len, 4) + 1), 0, len))}
+    end
   end
 end
