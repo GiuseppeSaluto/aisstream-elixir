@@ -1,6 +1,6 @@
-[![tests](https://github.com/GiuseppeSaluto/aisstream-elixir/actions/workflows/tests.yml/badge.svg)](https://github.com/GiuseppeSaluto/aisstream-elixir/actions/workflows/tests.yml/)
-
 # AisStream
+
+[![test](https://github.com/GiuseppeSaluto/aisstream-elixir/actions/workflows/test.yml/badge.svg)](https://github.com/GiuseppeSaluto/aisstream-elixir/actions/workflows/test.yml)
 
 Unofficial Elixir client for the [AISStream](https://aisstream.io) WebSocket API. Not affiliated with aisstream.io.
 
