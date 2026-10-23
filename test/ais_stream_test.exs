@@ -6,15 +6,43 @@ defmodule AisStreamTest do
 
   describe "options" do
     test "missing :api_key raises KeyError" do
-      assert_raise KeyError, fn -> AisStream.start_link(bounding_boxes: @boxes) end
+      assert_raise KeyError, fn -> AisStream.start_link(bounding_boxes: @boxes, to: self()) end
     end
 
     test "missing :bounding_boxes raises KeyError" do
-      assert_raise KeyError, fn -> AisStream.start_link(api_key: "test-key") end
+      assert_raise KeyError, fn -> AisStream.start_link(api_key: "test-key", to: self()) end
+    end
+
+    # A local url keeps the test off the network if the option were not rejected.
+    test "missing :to raises KeyError" do
+      {_server, url} = start_server()
+
+      error =
+        assert_raise KeyError, fn ->
+          AisStream.start_link(api_key: "test-key", bounding_boxes: @boxes, url: url)
+        end
+
+      assert error.key == :to
+    end
+
+    test "an unknown option raises ArgumentError" do
+      {_server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+
+      assert_raise ArgumentError, fn -> AisStream.start_link(opts ++ [ping_intervall: 5]) end
+    end
+
+    test ":name registers the client process under that name" do
+      name = :"aisstream_test_client_#{System.unique_integer([:positive])}"
+      {_server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self(), name: name]
+      pid = start_supervised!({AisStream, opts})
+
+      assert Process.whereis(name) == pid
     end
 
     test "child_spec/1 starts the client via start_link/1" do
-      opts = [api_key: "test-key", bounding_boxes: @boxes]
+      opts = [api_key: "test-key", bounding_boxes: @boxes, to: self()]
       assert %{start: {AisStream, :start_link, [^opts]}} = AisStream.child_spec(opts)
     end
   end
@@ -74,16 +102,6 @@ defmodule AisStreamTest do
       refute_received {:aisstream, _}
     end
 
-    test ":to defaults to the caller of start_link" do
-      {server, url} = start_server()
-      {:ok, _pid} = AisStream.start_link(api_key: "test-key", bounding_boxes: @boxes, url: url)
-      assert_receive {:connected, _, _}, 1_000
-
-      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
-
-      assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
-    end
-
     test ":to accepts a registered name" do
       name = :"aisstream_test_sink_#{System.unique_integer([:positive])}"
       Process.register(self(), name)
@@ -124,6 +142,34 @@ defmodule AisStreamTest do
 
       assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
       assert Process.alive?(pid)
+    end
+
+    # The client's receipt of the frame is observed by tracing its mailbox; the
+    # :sys call that follows returns only after that frame has been handled.
+    test "drops messages while no process has the registered :to name, without crashing" do
+      name = :"aisstream_test_sink_#{System.unique_integer([:positive])}"
+      {server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: name]
+      pid = start_supervised!({AisStream, opts})
+      assert_receive {:connected, _, _}, 1_000
+
+      log =
+        capture_log(fn ->
+          :erlang.trace(pid, true, [:receive])
+          send(server, {:frame, 1, ~s({"MessageType":"PositionReport","MetaData":{"MMSI":1}})})
+          assert_receive {:trace, ^pid, :receive, {:tcp, _, _}}, 1_000
+          :erlang.trace(pid, false, [:receive])
+          :sys.get_state(pid)
+
+          Process.register(self(), name)
+          send(server, {:frame, 1, ~s({"MessageType":"PositionReport","MetaData":{"MMSI":2}})})
+          assert_receive {:aisstream, %{"MetaData" => %{"MMSI" => 2}}}, 1_000
+        end)
+
+      assert Process.alive?(pid)
+      refute log =~ "terminating"
+      refute_received {:aisstream, %{"MetaData" => %{"MMSI" => 1}}}
+      refute_received {:connected, _, _}
     end
   end
 
@@ -184,6 +230,28 @@ defmodule AisStreamTest do
 
       assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [1]}}, 1_000
     end
+
+    test "an error message is delivered but does not reset the backoff counter" do
+      {server, url} = start_server()
+
+      pid =
+        start_supervised!({AisStream, api_key: "k", bounding_boxes: @boxes, url: url, to: self()})
+
+      assert_receive {:connected, _, subscription}, 1_000
+      :erlang.trace_pattern({AisStream, :backoff, 1}, true, [:local])
+      :erlang.trace(pid, true, [:call])
+
+      send(server, :close)
+      assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [1]}}, 1_000
+      assert_receive {:connected, _, ^subscription}, 2_000
+      send(server, {:frame, 1, ~s({"error":"Api Key Is Not Valid"})})
+      assert_receive {:aisstream, %{"error" => "Api Key Is Not Valid"}}, 1_000
+      flush_traces(pid)
+      send(server, :close)
+
+      assert_receive {:trace, ^pid, :call, {AisStream, :backoff, [attempt]}}, 1_000
+      assert attempt == 2
+    end
   end
 
   describe "keepalive" do
@@ -214,6 +282,92 @@ defmodule AisStreamTest do
       end
 
       refute_received {:connected, _, _}
+    end
+
+    # The first check (50 ms) plus the first backoff step (1 s) bound the wait.
+    test "reconnects when the server never answers the upgrade request" do
+      {_server, url} = start_server(:no_upgrade)
+
+      opts = [
+        api_key: "test-key",
+        bounding_boxes: @boxes,
+        url: url,
+        to: self(),
+        ping_interval: 50
+      ]
+
+      start_supervised!({AisStream, opts})
+
+      assert_receive {:upgrade_request, _}, 1_000
+      assert_receive {:upgrade_request, _}, 2_000
+    end
+  end
+
+  describe "api key" do
+    test "the key can be given as a zero-arity function, called once" do
+      test = self()
+
+      fun = fn ->
+        send(test, :api_key_fun_called)
+        "fn-key"
+      end
+
+      {server, _, subscription} = start_client(api_key: fun)
+      assert subscription["APIKey"] == "fn-key"
+
+      send(server, :close)
+
+      assert_receive {:connected, _, %{"APIKey" => "fn-key"}}, 5_000
+      assert_received :api_key_fun_called
+      refute_received :api_key_fun_called
+    end
+
+    test "child_spec/1 with the function form does not contain the key" do
+      spec =
+        AisStream.child_spec(
+          api_key: fn -> "child-spec-secret-7Qz" end,
+          bounding_boxes: @boxes,
+          to: self()
+        )
+
+      refute inspect(spec, limit: :infinity, printable_limit: :infinity) =~
+               "child-spec-secret-7Qz"
+    end
+
+    # Crash trigger: a call the client does not handle makes the GenServer raise.
+    test "the crash report does not contain the key" do
+      key = "crash-report-secret-9Xk"
+      {_server, url} = start_server()
+      opts = [api_key: key, bounding_boxes: @boxes, url: url, to: self()]
+      pid = start_supervised!(Supervisor.child_spec({AisStream, opts}, restart: :temporary))
+      assert_receive {:connected, _, %{"APIKey" => ^key}}, 1_000
+      ref = Process.monitor(pid)
+
+      log =
+        capture_log(fn ->
+          catch_exit(GenServer.call(pid, :not_handled))
+          assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
+        end)
+
+      assert log =~ "terminating"
+      refute log =~ "(truncated)"
+      refute log =~ key
+    end
+
+    test ":sys.get_status/1 does not contain the key and the client keeps working" do
+      key = "get-status-secret-4Wm"
+      {server, url} = start_server()
+
+      pid =
+        start_supervised!({AisStream, api_key: key, bounding_boxes: @boxes, url: url, to: self()})
+
+      assert_receive {:connected, _, %{"APIKey" => ^key}}, 1_000
+
+      status = :sys.get_status(pid)
+
+      refute inspect(status, limit: :infinity, printable_limit: :infinity) =~ key
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+      assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
     end
   end
 
@@ -249,15 +403,23 @@ defmodule AisStreamTest do
   # Frames sent by the client after the subscription are reported to the test
   # as {:client_frame, opcode, payload}; when the client closes the connection
   # the server accepts the next one.
-  defp start_server do
+  # With :no_upgrade it reports {:upgrade_request, request} for each connection,
+  # never replies and keeps the socket open, then accepts the next connection.
+  defp start_server(mode \\ :upgrade) do
     test = self()
     {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
     {:ok, port} = :inet.port(listen)
-    server = spawn_link(fn -> serve(listen, test) end)
+    server = spawn_link(fn -> serve(listen, test, mode) end)
     {server, "ws://127.0.0.1:#{port}/v0/stream"}
   end
 
-  defp serve(listen, test) do
+  defp serve(listen, test, :no_upgrade) do
+    {:ok, socket} = :gen_tcp.accept(listen)
+    send(test, {:upgrade_request, recv_request(socket, "")})
+    serve(listen, test, :no_upgrade)
+  end
+
+  defp serve(listen, test, :upgrade) do
     {:ok, socket} = :gen_tcp.accept(listen)
     request = recv_request(socket, "")
     [_, key] = Regex.run(~r/sec-websocket-key:\s*(\S+)/i, request)
@@ -275,7 +437,7 @@ defmodule AisStreamTest do
     server = self()
     spawn(fn -> read_frames(socket, server, test) end)
     command_loop(socket)
-    serve(listen, test)
+    serve(listen, test, :upgrade)
   end
 
   defp command_loop(socket) do
