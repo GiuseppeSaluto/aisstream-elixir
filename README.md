@@ -56,11 +56,14 @@ children = [
 | `:to` | yes | pid or registered name receiving the messages |
 | `:name` | no | Name to register the client process under |
 | `:ping_interval` | no | Keepalive interval in ms, default `30_000` |
+| `:max_queue_len` | no | Drop messages while the local `:to` has this many queued, default `nil` (no limit) |
 | `:url` | no | Default `wss://stream.aisstream.io/v0/stream` |
 
 Notes:
 
 - If `:to` is a pid, the client stops when it exits; if it is a name with no process registered, messages are dropped.
+- `:max_queue_len` is a best-effort safeguard for consumers that can afford to lose messages, not backpressure. It only
+  applies to local processes and logs a warning at most once a minute while dropping.
 - The API key is redacted from crash reports. Under a supervisor pass it as a function, so it stays out of
   supervisor reports too.
 - AISStream closes the connection without an error on an invalid key: the client keeps retrying and logs it.

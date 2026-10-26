@@ -455,6 +455,105 @@ defmodule AisStreamTest do
     end
   end
 
+  # Never-reading consumers are sink processes; a ping answered with a pong
+  # proves the client handled every frame sent before it.
+  describe "max_queue_len" do
+    test "without the option every message is delivered" do
+      sink = start_sink()
+      {server, _, _} = start_client(to: sink)
+
+      send_positions(server, 1..10)
+      sync(server, "s1")
+
+      assert queue_len(sink) == 10
+    end
+
+    test "drops messages while the local consumer's queue is at the limit" do
+      sink = start_sink()
+      {server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: sink, max_queue_len: 3]
+
+      capture_log(fn ->
+        pid = start_supervised!({AisStream, opts})
+        assert_receive {:connected, _, _}, 1_000
+
+        send_positions(server, 1..10)
+        sync(server, "s1")
+
+        assert queue_len(sink) == 3
+        assert Process.alive?(pid)
+        sync(server, "s2")
+        refute_received {:connected, _, _}
+        assert mmsis(drain(sink)) == [1, 2, 3]
+      end)
+    end
+
+    test "many dropped messages log a single warning" do
+      sink = start_sink()
+      {server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: sink, max_queue_len: 2]
+
+      {pid, log} =
+        with_log([level: :warning, metadata: [:pid]], fn ->
+          pid = start_supervised!({AisStream, opts})
+          assert_receive {:connected, _, _}, 1_000
+
+          send_positions(server, 1..20)
+          sync(server, "s1")
+          drain(sink)
+          # Crossing the limit again within 60 s must not log again.
+          send_positions(server, 21..40)
+          sync(server, "s2")
+          pid
+        end)
+
+      tag = "pid=#{:erlang.pid_to_list(pid)} "
+      lines = log |> String.split("\n") |> Enum.filter(&(&1 =~ tag and &1 =~ "[warning]"))
+
+      assert length(lines) == 1
+      assert Process.alive?(pid)
+      assert queue_len(sink) == 2
+    end
+
+    test "delivery resumes once the consumer drains its mailbox" do
+      sink = start_sink()
+      {server, url} = start_server()
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: sink, max_queue_len: 2]
+
+      capture_log(fn ->
+        start_supervised!({AisStream, opts})
+        assert_receive {:connected, _, _}, 1_000
+
+        send_positions(server, 1..5)
+        sync(server, "s1")
+        assert mmsis(drain(sink)) == [1, 2]
+
+        send_positions(server, 6..7)
+        sync(server, "s2")
+        assert mmsis(drain(sink)) == [6, 7]
+      end)
+    end
+
+    for value <- [0, -1, 1.5, "10"] do
+      test "max_queue_len: #{inspect(value)} raises ArgumentError" do
+        {_server, url} = start_server()
+        opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+
+        assert_raise ArgumentError, fn ->
+          AisStream.start_link(opts ++ [max_queue_len: unquote(value)])
+        end
+      end
+    end
+
+    test "max_queue_len: nil is accepted" do
+      {server, _, _} = start_client(max_queue_len: nil)
+
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+
+      assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
+    end
+  end
+
   @tag :live
   test "live: receives AIS messages from stream.aisstream.io" do
     start_supervised!(
@@ -556,6 +655,51 @@ defmodule AisStreamTest do
       msg when msg in [:close, {:closed, socket}] ->
         :gen_tcp.close(socket)
     end
+  end
+
+  # A consumer that never reads {:aisstream, _}; {:drain, from} empties its mailbox.
+  defp start_sink do
+    spawn_link(fn -> sink_loop() end)
+  end
+
+  defp sink_loop do
+    receive do
+      {:drain, from} -> send(from, {:drained, flush_mailbox([])})
+    end
+
+    sink_loop()
+  end
+
+  defp flush_mailbox(acc) do
+    receive do
+      msg -> flush_mailbox([msg | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp drain(sink) do
+    send(sink, {:drain, self()})
+    assert_receive {:drained, messages}, 1_000
+    messages
+  end
+
+  defp queue_len(pid) do
+    {:message_queue_len, len} = Process.info(pid, :message_queue_len)
+    len
+  end
+
+  defp mmsis(messages), do: Enum.map(messages, fn {:aisstream, m} -> m["MetaData"]["MMSI"] end)
+
+  defp send_positions(server, range) do
+    for i <- range do
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport","MetaData":{"MMSI":#{i}}})})
+    end
+  end
+
+  defp sync(server, tag) do
+    send(server, {:frame, 9, tag})
+    assert_receive {:client_frame, 10, ^tag}, 1_000
   end
 
   defp flush_traces(pid) do

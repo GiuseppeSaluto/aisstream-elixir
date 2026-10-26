@@ -27,6 +27,9 @@ defmodule AisStream do
       pid exits; with a name not registered at that moment, messages are dropped.
     * `:name` - name to register the client process under.
     * `:ping_interval` - keepalive interval in ms, default `30_000`.
+    * `:max_queue_len` - drop messages while the local `:to` process has this many queued,
+      logging a warning at most once a minute. Best-effort, not backpressure; remote processes
+      always receive. Default `nil` (no limit).
     * `:url` - default `wss://stream.aisstream.io/v0/stream`.
   """
 
@@ -40,6 +43,7 @@ defmodule AisStream do
           | {:to, pid() | atom()}
           | {:name, GenServer.name()}
           | {:ping_interval, pos_integer()}
+          | {:max_queue_len, pos_integer() | nil}
           | {:url, String.t()}
 
   @doc """
@@ -58,8 +62,14 @@ defmodule AisStream do
         :to,
         :name,
         ping_interval: 30_000,
+        max_queue_len: nil,
         url: "wss://stream.aisstream.io/v0/stream"
       ])
+
+    max = opts[:max_queue_len]
+
+    unless is_nil(max) or (is_integer(max) and max > 0),
+      do: raise(ArgumentError, ":max_queue_len must be a positive integer, got: #{inspect(max)}")
 
     # A function keeps the key out of supervisor reports
     api_key =
@@ -87,6 +97,8 @@ defmodule AisStream do
         subscription: JSON.encode!(subscription),
         to: Keyword.fetch!(opts, :to),
         ping_interval: opts[:ping_interval],
+        max_queue_len: max,
+        last_drop_warning: nil,
         attempt: 0,
         conn: nil
       },
@@ -214,7 +226,11 @@ defmodule AisStream do
     case JSON.decode(payload) do
       {:ok, message} ->
         # A registered :to may be restarting: drop rather than crash
-        if dest = GenServer.whereis(state.to), do: send(dest, {:aisstream, message})
+        state =
+          case GenServer.whereis(state.to) do
+            nil -> state
+            dest -> deliver(state, dest, {:aisstream, message})
+          end
 
         # Error messages must not reset the backoff
         if match?(%{"error" => _}, message), do: state, else: %{state | attempt: 0}
@@ -234,6 +250,32 @@ defmodule AisStream do
 
   defp handle_frame({:error, reason}, state), do: reconnect(state, reason)
   defp handle_frame(_frame, state), do: state
+
+  defp deliver(state, dest, message) do
+    if queue_full?(state.max_queue_len, dest) do
+      warn_drop(state)
+    else
+      send(dest, message)
+      state
+    end
+  end
+
+  # Process.info/2 only works on local pids
+  defp queue_full?(max, dest) when is_integer(max) and is_pid(dest) and node(dest) == node(),
+    do: match?({:message_queue_len, len} when len >= max, Process.info(dest, :message_queue_len))
+
+  defp queue_full?(_max, _dest), do: false
+
+  defp warn_drop(state) do
+    now = System.monotonic_time(:millisecond)
+
+    if state.last_drop_warning == nil or now - state.last_drop_warning >= 60_000 do
+      Logger.warning("AisStream: :to has #{state.max_queue_len} queued messages, dropping")
+      %{state | last_drop_warning: now}
+    else
+      state
+    end
+  end
 
   defp send_frame(state, frame) do
     with {:ok, websocket, data} <- Mint.WebSocket.encode(state.websocket, frame),
