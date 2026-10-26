@@ -157,7 +157,15 @@ defmodule AisStream do
            ) do
       # Started here so an unanswered upgrade can't hang the client
       Process.send_after(self(), {:keepalive, ref}, state.ping_interval)
-      Map.merge(state, %{conn: conn, ref: ref, status: nil, headers: [], received?: false})
+
+      Map.merge(state, %{
+        conn: conn,
+        ref: ref,
+        status: nil,
+        headers: [],
+        websocket: nil,
+        received?: false
+      })
     else
       {:error, reason} -> reconnect(state, reason)
       {:error, conn, reason} -> reconnect(%{state | conn: conn}, reason)
@@ -183,6 +191,9 @@ defmodule AisStream do
         reconnect(%{state | conn: conn}, reason)
     end
   end
+
+  # HTTP error bodies arrive before :done validates the upgrade.
+  defp handle_response({:data, _ref, _data}, %{websocket: nil} = state), do: state
 
   defp handle_response({:data, _ref, data}, state) do
     case Mint.WebSocket.decode(state.websocket, data) do
