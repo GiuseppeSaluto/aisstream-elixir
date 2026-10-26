@@ -55,6 +55,27 @@ defmodule AisStreamTest do
       assert subscription == %{"APIKey" => "test-key", "BoundingBoxes" => @boxes}
     end
 
+    test "preserves the URL query in the upgrade target and excludes the fragment" do
+      {_server, url} = start_server()
+      url = url <> "?token=a%2Fb&filter=PositionReport#local-fragment"
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+      start_supervised!({AisStream, opts})
+
+      assert_receive {:connected, request, _}, 1_000
+      assert request =~ "GET /v0/stream?token=a%2Fb&filter=PositionReport HTTP/1.1\r\n"
+      refute request =~ "local-fragment"
+    end
+
+    test "uses a slash for an empty URL path while preserving the query" do
+      {_server, url} = start_server()
+      url = String.replace(url, "/v0/stream", "?token=example")
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+      start_supervised!({AisStream, opts})
+
+      assert_receive {:connected, request, _}, 1_000
+      assert request =~ "GET /?token=example HTTP/1.1\r\n"
+    end
+
     test "includes FilterMessageTypes when given" do
       {_server, _request, subscription} = start_client(filter_message_types: ["PositionReport"])
 

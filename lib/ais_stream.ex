@@ -149,10 +149,11 @@ defmodule AisStream do
 
   defp connect(%{url: url} = state) do
     {http, ws} = if url.scheme == "wss", do: {:https, :wss}, else: {:http, :ws}
+    path = (url.path || "/") <> if(url.query, do: "?" <> url.query, else: "")
 
     with {:ok, conn} <- Mint.HTTP.connect(http, url.host, url.port, protocols: [:http1]),
          {:ok, conn, ref} <-
-           Mint.WebSocket.upgrade(ws, conn, url.path || "/", [],
+           Mint.WebSocket.upgrade(ws, conn, path, [],
              extensions: [Mint.WebSocket.PerMessageDeflate]
            ) do
       # Started here so an unanswered upgrade can't hang the client
