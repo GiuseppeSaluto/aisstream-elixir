@@ -32,6 +32,32 @@ defmodule AisStreamTest do
       assert_raise ArgumentError, fn -> AisStream.start_link(opts ++ [ping_intervall: 5]) end
     end
 
+    test ":ping_interval that is not a positive integer raises ArgumentError" do
+      {_server, url} = start_server(:no_upgrade)
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+
+      for value <- [0, -1, 1.5, "1000"] do
+        assert_raise ArgumentError, fn -> AisStream.start_link(opts ++ [ping_interval: value]) end
+      end
+
+      refute_receive {:upgrade_request, _}, 100
+    end
+
+    test ":url without a host raises ArgumentError" do
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: "wss:///stream", to: self()]
+
+      assert_raise ArgumentError, fn -> AisStream.start_link(opts) end
+    end
+
+    test ":url with a scheme other than ws or wss raises ArgumentError" do
+      {_server, url} = start_server(:no_upgrade)
+      url = String.replace_prefix(url, "ws://", "http://")
+      opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+
+      assert_raise ArgumentError, fn -> AisStream.start_link(opts) end
+      refute_receive {:upgrade_request, _}, 100
+    end
+
     test ":name registers the client process under that name" do
       name = :"aisstream_test_client_#{System.unique_integer([:positive])}"
       {_server, url} = start_server()

@@ -49,7 +49,8 @@ defmodule AisStream do
   @doc """
   Starts the client.
 
-  Raises `ArgumentError` on an unknown option and `KeyError` if `:api_key`, `:bounding_boxes`
+  Raises `ArgumentError` on an unknown option or an invalid `:ping_interval`, `:max_queue_len`
+  or `:url`, and `KeyError` if `:api_key`, `:bounding_boxes`
   or `:to` is missing.
   """
   @spec start_link([option()]) :: GenServer.on_start()
@@ -65,6 +66,14 @@ defmodule AisStream do
         max_queue_len: nil,
         url: "wss://stream.aisstream.io/v0/stream"
       ])
+
+    unless is_integer(opts[:ping_interval]) and opts[:ping_interval] > 0,
+      do: raise(ArgumentError, ":ping_interval must be a positive integer")
+
+    url = URI.parse(opts[:url])
+
+    unless url.scheme in ["ws", "wss"] and url.host not in [nil, ""],
+      do: raise(ArgumentError, ":url must be a ws:// or wss:// URL with a host")
 
     max = opts[:max_queue_len]
 
@@ -93,7 +102,7 @@ defmodule AisStream do
     GenServer.start_link(
       __MODULE__,
       %{
-        url: URI.parse(opts[:url]),
+        url: url,
         subscription: JSON.encode!(subscription),
         to: Keyword.fetch!(opts, :to),
         ping_interval: opts[:ping_interval],

@@ -14,7 +14,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   process (e.g. during a restart), messages are dropped instead of crashing the client.
 - Options `:api_key`, `:bounding_boxes`, `:to` (required), `:filter_message_types`, `:name`, `:ping_interval`,
   `:max_queue_len`, `:url`;
-  unknown options raise `ArgumentError`.
+  unknown options and invalid `:ping_interval`, `:max_queue_len` or `:url` values raise `ArgumentError`.
 - Automatic reconnection with a 1-30 s backoff; the subscription is re-sent after every reconnection.
 - Keepalive: pings every `:ping_interval` ms and reconnects when the server stops answering, including when it
   never answers the WebSocket handshake.
