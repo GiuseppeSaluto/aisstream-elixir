@@ -336,6 +336,90 @@ defmodule AisStreamTest do
     end
   end
 
+  # The client is suspended while a frame reaches its mailbox, then its socket
+  # is closed: Mint parses the frame, fails to re-arm the socket and returns
+  # {:error, conn, %Mint.TransportError{}, responses} with the frame in them.
+  describe "mint errors with responses" do
+    test "a message read together with the error is delivered once" do
+      {pid, server, _} = start_failing_client()
+
+      capture_log(fn ->
+        fail_after_frame(pid, server, 1, ~s({"MessageType":"PositionReport"}))
+
+        assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
+        refute_receive {:aisstream, _}, 200
+      end)
+    end
+
+    test "reconnects and subscribes again after the error" do
+      {pid, server, subscription} = start_failing_client()
+
+      capture_log(fn ->
+        fail_after_frame(pid, server, 1, ~s({"MessageType":"PositionReport"}))
+
+        assert_receive {:connected, _, ^subscription}, 3_000
+        send(server, {:frame, 1, ~s({"MessageType":"ShipStaticData"})})
+        assert_receive {:aisstream, %{"MessageType" => "ShipStaticData"}}, 1_000
+        assert Process.alive?(pid)
+      end)
+    end
+
+    test "the error schedules exactly one reconnection" do
+      {pid, server, subscription} = start_failing_client()
+
+      capture_log(fn ->
+        assert_single_reconnection(pid, subscription, fn ->
+          fail_after_frame(pid, server, 1, ~s({"MessageType":"PositionReport"}))
+        end)
+      end)
+    end
+
+    test "a close frame read together with the error schedules exactly one reconnection" do
+      {pid, server, subscription} = start_failing_client()
+
+      capture_log(fn ->
+        assert_single_reconnection(pid, subscription, fn ->
+          fail_after_frame(pid, server, 8, <<1_001::16, "going away">>)
+        end)
+
+        refute_received {:aisstream, _}
+      end)
+    end
+  end
+
+  defp start_failing_client do
+    {server, url} = start_server()
+    opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+    pid = start_supervised!(Supervisor.child_spec({AisStream, opts}, restart: :temporary))
+    assert_receive {:connected, _, subscription}, 1_000
+    {pid, server, subscription}
+  end
+
+  # The client's socket is the only port it is linked to.
+  defp fail_after_frame(pid, server, opcode, payload) do
+    {:links, links} = Process.info(pid, :links)
+    [socket] = Enum.filter(links, &is_port/1)
+    :sys.suspend(pid)
+    :erlang.trace(pid, true, [:receive])
+    send(server, {:frame, opcode, payload})
+    assert_receive {:trace, ^pid, :receive, {:tcp, ^socket, _}}, 1_000
+    :erlang.trace(pid, false, [:receive])
+    :ok = :gen_tcp.close(socket)
+    :sys.resume(pid)
+  end
+
+  # The :sys call returns after the frame and the error have been handled; a
+  # second reconnection would raise the attempt to 2 or open another connection
+  # within its delay (2 s).
+  defp assert_single_reconnection(pid, subscription, fail) do
+    fail.()
+
+    assert :sys.get_state(pid).attempt == 1
+    assert_receive {:connected, _, ^subscription}, 3_000
+    refute_receive {:connected, _, _}, 2_500
+    assert Process.alive?(pid)
+  end
+
   describe "close handshake" do
     for {label, payload} <- [
           {"with a code and reason", <<1_001::16, "going away">>},

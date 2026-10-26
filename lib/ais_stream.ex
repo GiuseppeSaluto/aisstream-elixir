@@ -160,8 +160,10 @@ defmodule AisStream do
       {:ok, conn, responses} ->
         {:noreply, Enum.reduce(responses, %{state | conn: conn}, &handle_response/2)}
 
-      {:error, conn, reason, _responses} ->
-        {:noreply, reconnect(%{state | conn: conn}, reason)}
+      # Mint may return data read before the error
+      {:error, conn, reason, responses} ->
+        state = Enum.reduce(responses, %{state | conn: conn}, &handle_response/2)
+        {:noreply, if(state.conn, do: reconnect(state, reason), else: state)}
 
       :unknown ->
         {:noreply, state}
