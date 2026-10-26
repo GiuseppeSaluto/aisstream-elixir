@@ -173,6 +173,41 @@ defmodule AisStreamTest do
     end
   end
 
+  describe "HTTP upgrade errors" do
+    test "reconnects after a rejected initial upgrade with a body without leaking the key" do
+      {_server, url} = start_server(:reject_once)
+      assert_upgrade_recovery(url)
+    end
+
+    test "reconnects after a rejected upgrade following an established connection" do
+      {server, url} = start_server()
+      assert_upgrade_recovery(url, fn -> send(server, :reject_next_upgrade) end)
+    end
+  end
+
+  defp assert_upgrade_recovery(url, disconnect \\ nil) do
+    key = "http-upgrade-secret-5Rt"
+    opts = [api_key: key, bounding_boxes: @boxes, url: url, to: self()]
+
+    log =
+      capture_log(fn ->
+        pid = start_supervised!(Supervisor.child_spec({AisStream, opts}, restart: :temporary))
+
+        if disconnect do
+          assert_receive {:connected, _, %{"APIKey" => ^key}}, 1_000
+          disconnect.()
+        end
+
+        assert_receive {:upgrade_rejected, _}, 2_000
+        assert_receive {:connected, _, %{"APIKey" => ^key}}, 4_000
+        assert Process.alive?(pid)
+        refute_received {:aisstream, _}
+      end)
+
+    refute log =~ "terminating"
+    refute log =~ key
+  end
+
   describe "reconnection" do
     # Waits for the real first backoff step (1 s): the spec gives no way to shorten it.
     test "reconnects after disconnection and subscribes again" do
@@ -419,6 +454,23 @@ defmodule AisStreamTest do
     serve(listen, test, :no_upgrade)
   end
 
+  defp serve(listen, test, :reject_once) do
+    {:ok, socket} = :gen_tcp.accept(listen)
+    request = recv_request(socket, "")
+
+    :ok =
+      :gen_tcp.send(
+        socket,
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\n\r\n" <> <<0x81, 2, "{}">>
+      )
+
+    send(test, {:upgrade_rejected, request})
+    # Wait for the client to close, so the body is processed before disconnection.
+    {:error, :closed} = :gen_tcp.recv(socket, 0, 5_000)
+    :gen_tcp.close(socket)
+    serve(listen, test, :upgrade)
+  end
+
   defp serve(listen, test, :upgrade) do
     {:ok, socket} = :gen_tcp.accept(listen)
     request = recv_request(socket, "")
@@ -436,8 +488,8 @@ defmodule AisStreamTest do
     send(test, {:connected, request, JSON.decode!(subscription)})
     server = self()
     spawn(fn -> read_frames(socket, server, test) end)
-    command_loop(socket)
-    serve(listen, test, :upgrade)
+    mode = if command_loop(socket) == :reject_next_upgrade, do: :reject_once, else: :upgrade
+    serve(listen, test, mode)
   end
 
   defp command_loop(socket) do
@@ -447,6 +499,10 @@ defmodule AisStreamTest do
           :gen_tcp.send(socket, <<1::1, 0::3, opcode::4, 0::1, byte_size(payload)::7>> <> payload)
 
         command_loop(socket)
+
+      :reject_next_upgrade ->
+        :gen_tcp.close(socket)
+        :reject_next_upgrade
 
       msg when msg in [:close, {:closed, socket}] ->
         :gen_tcp.close(socket)
