@@ -310,6 +310,34 @@ defmodule AisStreamTest do
     end
   end
 
+  describe "close handshake" do
+    for {label, payload} <- [
+          {"with a code and reason", <<1_001::16, "going away">>},
+          {"with a code only", <<1_000::16>>},
+          {"without a payload", ""}
+        ] do
+      @tag :close_handshake
+      test "acknowledges a close #{label} before reconnecting" do
+        payload = unquote(payload)
+        {server, url} = start_server()
+        opts = [api_key: "test-key", bounding_boxes: @boxes, url: url, to: self()]
+        pid = start_supervised!(Supervisor.child_spec({AisStream, opts}, restart: :temporary))
+        assert_receive {:connected, _, subscription}, 1_000
+
+        send(server, {:frame, 8, payload})
+
+        # Mint normalizes an empty close to code 1000.
+        reply = if payload == "", do: <<1_000::16>>, else: payload
+        assert_receive {:client_frame, 8, ^reply}, 1_000
+        assert_receive {:connected, _, ^subscription}, 3_000
+        assert Process.alive?(pid)
+
+        send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+        assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
+      end
+    end
+  end
+
   describe "keepalive" do
     test "sends a ping at the check when something was received" do
       {server, _, _} = start_client(ping_interval: 50)

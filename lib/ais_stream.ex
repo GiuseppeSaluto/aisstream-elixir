@@ -226,7 +226,12 @@ defmodule AisStream do
   end
 
   defp handle_frame({:ping, data}, state), do: send_frame(state, {:pong, data})
-  defp handle_frame({:close, code, reason}, state), do: reconnect(state, {:close, code, reason})
+
+  defp handle_frame({:close, _code, _reason} = frame, state) do
+    state = send_frame(state, frame)
+    if state.conn, do: reconnect(state, frame), else: state
+  end
+
   defp handle_frame({:error, reason}, state), do: reconnect(state, reason)
   defp handle_frame(_frame, state), do: state
 
