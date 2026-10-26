@@ -2,7 +2,7 @@ defmodule AisStream.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/GiuseppeSaluto/aisstream-elixir"
+  @source_url "https://github.com/GiuseppeSaluto/aisstream_elixir"
 
   def project do
     [
