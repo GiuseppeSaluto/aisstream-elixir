@@ -664,6 +664,52 @@ defmodule AisStreamTest do
     end
   end
 
+  # The server negotiates permessage-deflate with the parameters AISStream uses and
+  # fails (linked to the test) if a client data frame arrives without RSV1.
+  describe "compression" do
+    test "sends a compressed subscription once compression is negotiated" do
+      {_server, request, subscription} = start_client([], :deflate)
+
+      assert request =~ ~r/sec-websocket-extensions:[^\r\n]*permessage-deflate/i
+      assert subscription == %{"APIKey" => "test-key", "BoundingBoxes" => @boxes}
+    end
+
+    test "the compressed subscription includes FilterMessageTypes when given" do
+      {_server, _, subscription} =
+        start_client([filter_message_types: ["PositionReport"]], :deflate)
+
+      assert subscription == %{
+               "APIKey" => "test-key",
+               "BoundingBoxes" => @boxes,
+               "FilterMessageTypes" => ["PositionReport"]
+             }
+    end
+
+    test "compressed text and binary JSON frames are delivered as decoded maps" do
+      {server, _, _} = start_client([], :deflate)
+
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport","MetaData":{"MMSI":1}})})
+      send(server, {:frame, 2, ~s({"MessageType":"ShipStaticData"})})
+
+      assert_receive {:aisstream,
+                      %{"MessageType" => "PositionReport", "MetaData" => %{"MMSI" => 1}}},
+                     1_000
+
+      assert_receive {:aisstream, %{"MessageType" => "ShipStaticData"}}, 1_000
+    end
+
+    test "a reconnection negotiates compression again and resends the subscription" do
+      {server, _, subscription} = start_client([], :deflate)
+
+      send(server, :close)
+
+      assert_receive {:connected, request, ^subscription}, 5_000
+      assert request =~ ~r/sec-websocket-extensions:[^\r\n]*permessage-deflate/i
+      send(server, {:frame, 1, ~s({"MessageType":"PositionReport"})})
+      assert_receive {:aisstream, %{"MessageType" => "PositionReport"}}, 1_000
+    end
+  end
+
   @tag :live
   test "live: receives AIS messages from stream.aisstream.io" do
     start_supervised!(
@@ -677,8 +723,8 @@ defmodule AisStreamTest do
   end
 
   # Starts a client against a local server and waits for its subscription.
-  defp start_client(opts \\ []) do
-    {server, url} = start_server()
+  defp start_client(opts \\ [], mode \\ :upgrade) do
+    {server, url} = start_server(mode)
 
     start_supervised!(
       {AisStream,
@@ -696,6 +742,8 @@ defmodule AisStreamTest do
   # Frames sent by the client after the subscription are reported to the test
   # as {:client_frame, opcode, payload}; when the client closes the connection
   # the server accepts the next one.
+  # With :deflate it accepts permessage-deflate as AISStream does: data frames
+  # are compressed both ways and client data frames must have RSV1 set.
   # With :no_upgrade it reports {:upgrade_request, request} for each connection,
   # never replies and keeps the socket open, then accepts the next connection.
   defp start_server(mode \\ :upgrade) do
@@ -729,34 +777,48 @@ defmodule AisStreamTest do
     serve(listen, test, :upgrade)
   end
 
-  defp serve(listen, test, :upgrade) do
+  defp serve(listen, test, mode) when mode in [:upgrade, :deflate] do
+    deflate = mode == :deflate
     {:ok, socket} = :gen_tcp.accept(listen)
     request = recv_request(socket, "")
     [_, key] = Regex.run(~r/sec-websocket-key:\s*(\S+)/i, request)
     accept = Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 
+    extensions =
+      if deflate,
+        do:
+          "sec-websocket-extensions: permessage-deflate; server_no_context_takeover; " <>
+            "client_no_context_takeover\r\n",
+        else: ""
+
     :ok =
       :gen_tcp.send(
         socket,
         "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n" <>
-          "sec-websocket-accept: #{accept}\r\n\r\n"
+          "sec-websocket-accept: #{accept}\r\n" <> extensions <> "\r\n"
       )
 
-    {1, subscription} = recv_frame(socket)
+    {1, subscription} = recv_frame(socket, 1_000, deflate)
     send(test, {:connected, request, JSON.decode!(subscription)})
     server = self()
-    spawn(fn -> read_frames(socket, server, test) end)
-    mode = if command_loop(socket) == :reject_next_upgrade, do: :reject_once, else: :upgrade
-    serve(listen, test, mode)
+    spawn(fn -> read_frames(socket, server, test, deflate) end)
+
+    case command_loop(socket, deflate) do
+      :reject_next_upgrade -> serve(listen, test, :reject_once)
+      _ -> serve(listen, test, mode)
+    end
   end
 
-  defp command_loop(socket) do
+  defp command_loop(socket, deflate) do
     receive do
-      {:frame, opcode, payload} when byte_size(payload) < 126 ->
-        :ok =
-          :gen_tcp.send(socket, <<1::1, 0::3, opcode::4, 0::1, byte_size(payload)::7>> <> payload)
+      {:frame, opcode, payload} when deflate and opcode in [1, 2] ->
+        payload = deflate(payload)
+        :ok = :gen_tcp.send(socket, server_frame(0b100, opcode, payload))
+        command_loop(socket, deflate)
 
-        command_loop(socket)
+      {:frame, opcode, payload} when byte_size(payload) < 126 ->
+        :ok = :gen_tcp.send(socket, server_frame(0, opcode, payload))
+        command_loop(socket, deflate)
 
       :reject_next_upgrade ->
         :gen_tcp.close(socket)
@@ -820,14 +882,14 @@ defmodule AisStreamTest do
     end
   end
 
-  defp read_frames(socket, server, test) do
-    case recv_frame(socket, :infinity) do
+  defp read_frames(socket, server, test, deflate) do
+    case recv_frame(socket, :infinity, deflate) do
       {:error, _} ->
         send(server, {:closed, socket})
 
       {opcode, payload} ->
         send(test, {:client_frame, opcode, payload})
-        read_frames(socket, server, test)
+        read_frames(socket, server, test, deflate)
     end
   end
 
@@ -840,9 +902,25 @@ defmodule AisStreamTest do
     end
   end
 
-  # Client frames are always masked (RFC 6455 5.3).
-  defp recv_frame(socket, timeout \\ 1_000) do
-    with {:ok, <<_fin_rsv::4, opcode::4, 1::1, len::7>>} <- :gen_tcp.recv(socket, 2, timeout),
+  # Client frames are always masked (RFC 6455 5.3). With deflate, data frames
+  # must have RSV1 set and are inflated; control frames are never compressed.
+  defp recv_frame(socket, timeout, deflate) do
+    case recv_raw_frame(socket, timeout) do
+      {rsv1, opcode, payload} when deflate and opcode in [1, 2] ->
+        1 = rsv1
+        {opcode, inflate(payload)}
+
+      {0, opcode, payload} ->
+        {opcode, payload}
+
+      error ->
+        error
+    end
+  end
+
+  defp recv_raw_frame(socket, timeout) do
+    with {:ok, <<_fin::1, rsv1::1, _rsv::2, opcode::4, 1::1, len::7>>} <-
+           :gen_tcp.recv(socket, 2, timeout),
          {:ok, len} <-
            (case len do
               126 -> with {:ok, <<n::16>>} <- :gen_tcp.recv(socket, 2, 1_000), do: {:ok, n}
@@ -850,7 +928,33 @@ defmodule AisStreamTest do
               n -> {:ok, n}
             end),
          {:ok, <<mask::binary-4, masked::binary>>} <- :gen_tcp.recv(socket, len + 4, 1_000) do
-      {opcode, :crypto.exor(masked, binary_part(:binary.copy(mask, div(len, 4) + 1), 0, len))}
+      {rsv1, opcode,
+       :crypto.exor(masked, binary_part(:binary.copy(mask, div(len, 4) + 1), 0, len))}
     end
+  end
+
+  # Server frames are never masked.
+  defp server_frame(rsv, opcode, payload) when byte_size(payload) < 126,
+    do: <<1::1, rsv::3, opcode::4, 0::1, byte_size(payload)::7>> <> payload
+
+  defp server_frame(rsv, opcode, payload),
+    do: <<1::1, rsv::3, opcode::4, 0::1, 126::7, byte_size(payload)::16>> <> payload
+
+  # Raw deflate (window bits -15), a fresh context per message: both sides
+  # negotiated no_context_takeover (RFC 7692 7.2).
+  defp deflate(payload) do
+    z = :zlib.open()
+    :ok = :zlib.deflateInit(z, :default, :deflated, -15, 8, :default)
+    data = IO.iodata_to_binary(:zlib.deflate(z, payload, :sync))
+    :zlib.close(z)
+    binary_part(data, 0, byte_size(data) - 4)
+  end
+
+  defp inflate(data) do
+    z = :zlib.open()
+    :ok = :zlib.inflateInit(z, -15)
+    payload = IO.iodata_to_binary(:zlib.inflate(z, data <> <<0, 0, 0xFF, 0xFF>>))
+    :zlib.close(z)
+    payload
   end
 end
